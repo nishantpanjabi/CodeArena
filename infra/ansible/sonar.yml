@@ -1,0 +1,225 @@
+- name: Configure SonarQube EC2
+  hosts: sonar
+  become: true
+
+  vars:
+    sonar_version: "9.9.4.87374"
+    sonar_user: sonar
+    sonar_home: /opt/sonarqube
+    node_exporter_version: "1.8.1"
+
+  tasks:
+    - name: Set vm.max_map_count
+      sysctl:
+        name: vm.max_map_count
+        value: "262144"
+        state: present
+        reload: true
+
+    - name: Set fs.file-max
+      sysctl:
+        name: fs.file-max
+        value: "65536"
+        state: present
+        reload: true
+
+    - name: Install Java
+      apt:
+        name: openjdk-17-jre
+        update_cache: true
+
+    - name: Create sonar user
+      user:
+        name: "{{ sonar_user }}"
+        shell: /bin/bash
+        create_home: false
+
+    - name: Download SonarQube
+      get_url:
+        url: "https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-{{ sonar_version }}.zip"
+        dest: /tmp/sonarqube.zip
+        mode: "0644"
+
+    - name: Install unzip
+      apt:
+        name: unzip
+        update_cache: true
+
+    - name: Unzip SonarQube
+      unarchive:
+        src: /tmp/sonarqube.zip
+        dest: /opt/
+        remote_src: true
+
+    - name: Set SonarQube directory
+      command: "mv /opt/sonarqube-{{ sonar_version }} {{ sonar_home }}"
+      args:
+        creates: "{{ sonar_home }}"
+
+    - name: Set ownership
+      file:
+        path: "{{ sonar_home }}"
+        owner: "{{ sonar_user }}"
+        group: "{{ sonar_user }}"
+        recurse: true
+
+    - name: Create systemd service
+      copy:
+        dest: /etc/systemd/system/sonarqube.service
+        content: |
+          [Unit]
+          Description=SonarQube service
+          After=network.target
+
+          [Service]
+          Type=forking
+          ExecStart={{ sonar_home }}/bin/linux-x86-64/sonar.sh start
+          ExecStop={{ sonar_home }}/bin/linux-x86-64/sonar.sh stop
+          User={{ sonar_user }}
+          Group={{ sonar_user }}
+          Restart=always
+          LimitNOFILE=65536
+          LimitNPROC=4096
+          TimeoutStartSec=300
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: true
+
+    - name: Enable and start SonarQube
+      service:
+        name: sonarqube
+        state: started
+        enabled: true
+
+    - name: Wait for SonarQube to be ready (port 9000)
+      wait_for:
+        port: 9000
+        delay: 15
+        timeout: 300
+
+    # Give the web server time to fully initialize all API endpoints
+    - name: Wait for SonarQube API to be fully UP
+      uri:
+        url: "http://localhost:9000/api/system/status"
+        method: GET
+        return_content: true
+      register: sonar_status
+      until: sonar_status.status == 200 and (sonar_status.json.status | default('DOWN')) == 'UP'
+      retries: 30
+      delay: 10
+
+    # ── Change default admin password ─────────────────────────────
+    - name: Change SonarQube admin password
+      uri:
+        url: "http://localhost:9000/api/users/change_password"
+        method: POST
+        user: admin
+        password: admin
+        force_basic_auth: true
+        body_format: form-urlencoded
+        body:
+          login: admin
+          password: "{{ sonar_admin_password }}"
+          previousPassword: admin
+        status_code: [204, 400]  # 400 = already changed, that's fine
+      ignore_errors: true
+
+    # ── Generate API token for Jenkins ────────────────────────────
+    - name: Revoke existing jenkins-token if any (idempotent)
+      uri:
+        url: "http://localhost:9000/api/user_tokens/revoke"
+        method: POST
+        user: admin
+        password: "{{ sonar_admin_password }}"
+        force_basic_auth: true
+        body_format: form-urlencoded
+        body:
+          login: admin
+          name: jenkins-token
+        status_code: [204, 400]
+      ignore_errors: true
+
+    - name: Generate SonarQube API token for Jenkins
+      uri:
+        url: "http://localhost:9000/api/user_tokens/generate"
+        method: POST
+        user: admin
+        password: "{{ sonar_admin_password }}"
+        force_basic_auth: true
+        body_format: form-urlencoded
+        body:
+          name: jenkins-token
+        return_content: true
+        status_code: 200
+      register: sonar_token_response
+
+    - name: Set sonar_token fact (shared with jenkins play via hostvars)
+      set_fact:
+        sonar_token: "{{ sonar_token_response.json.token }}"
+
+    - name: Save sonar token to Ansible controller
+      local_action:
+        module: copy
+        content: "{{ sonar_token }}"
+        dest: /tmp/sonar_token.txt
+        mode: "0600"
+
+    - name: Show generated token (save this!)
+      debug:
+        msg: "SonarQube token for Jenkins: {{ sonar_token }}"
+
+    # ── node_exporter ──────────────────────────────────────────
+    - name: Check if node_exporter is already installed
+      stat:
+        path: /usr/local/bin/node_exporter
+      register: node_exporter_bin
+
+    - name: Download node_exporter
+      get_url:
+        url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+        dest: /tmp/node_exporter.tar.gz
+        mode: "0644"
+      when: not node_exporter_bin.stat.exists
+
+    - name: Extract node_exporter
+      unarchive:
+        src: /tmp/node_exporter.tar.gz
+        dest: /tmp/
+        remote_src: true
+      when: not node_exporter_bin.stat.exists
+
+    - name: Install node_exporter binary
+      copy:
+        src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+        dest: /usr/local/bin/node_exporter
+        mode: "0755"
+        remote_src: true
+      when: not node_exporter_bin.stat.exists
+
+    - name: Create node_exporter systemd service
+      copy:
+        dest: /etc/systemd/system/node_exporter.service
+        content: |
+          [Unit]
+          Description=Prometheus Node Exporter
+          After=network.target
+
+          [Service]
+          User=nobody
+          ExecStart=/usr/local/bin/node_exporter
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable and start node_exporter
+      systemd:
+        name: node_exporter
+        state: started
+        enabled: true
+        daemon_reload: true
